@@ -55,6 +55,19 @@ export default function App() {
     loadTasks(scope);
   }, [scope]);
 
+  // Belt-and-suspenders refresh on top of the SSE stream: if a connection
+  // drops silently (sleep/wake, a flaky network), the board is never more
+  // than a few minutes stale.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      loadOverview();
+      loadTasks();
+      loadTemplates();
+    }, 5 * 60 * 1000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope]);
+
   function pushToast(message, id) {
     const toastId = `${Date.now()}-${Math.random()}`;
     setToasts((t) => [...t, { id: toastId, message }]);
