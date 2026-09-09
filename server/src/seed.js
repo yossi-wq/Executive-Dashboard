@@ -1,4 +1,4 @@
-import { db } from "./db.js";
+import { query } from "./db.js";
 
 const MEMBERS = [
   { name: "Yossi Myers", role: "Owner / Principal", email: "yossi@ezmanagementct.com", color: "#6366f1" },
@@ -235,52 +235,55 @@ const KPI_SNAPSHOT = {
   },
 };
 
-function seed() {
-  const memberCount = db.prepare("SELECT COUNT(*) AS n FROM team_members").get().n;
-  if (memberCount === 0) {
-    const insertMember = db.prepare(
-      "INSERT INTO team_members (name, role, email, color, sort_order) VALUES (?, ?, ?, ?, ?)"
-    );
-    MEMBERS.forEach((m, i) => insertMember.run(m.name, m.role, m.email, m.color, i));
+let seeded = null;
+
+export function seed() {
+  if (!seeded) seeded = runSeed();
+  return seeded;
+}
+
+async function runSeed() {
+  const { rows: memberCountRows } = await query("SELECT COUNT(*) AS n FROM team_members");
+  if (Number(memberCountRows[0].n) === 0) {
+    for (let i = 0; i < MEMBERS.length; i++) {
+      const m = MEMBERS[i];
+      await query(
+        "INSERT INTO team_members (name, role, email, color, sort_order) VALUES ($1, $2, $3, $4, $5)",
+        [m.name, m.role, m.email, m.color, i]
+      );
+    }
     console.log(`Seeded ${MEMBERS.length} team members.`);
   }
 
-  const templateCount = db.prepare("SELECT COUNT(*) AS n FROM task_templates").get().n;
-  if (templateCount === 0) {
-    const insertTemplate = db.prepare(
-      `INSERT INTO task_templates (title, description, category, cadence_label, cron_expr, sop_ref, source, status)
-       VALUES (?, ?, ?, ?, ?, ?, 'automation', 'active')`
-    );
-    const insertAssignee = db.prepare(
-      "INSERT INTO template_assignees (template_id, member_id) VALUES (?, ?)"
-    );
-    const getMemberId = db.prepare("SELECT id FROM team_members WHERE name = ?");
-
+  const { rows: templateCountRows } = await query("SELECT COUNT(*) AS n FROM task_templates");
+  if (Number(templateCountRows[0].n) === 0) {
     for (const t of TEMPLATES) {
-      const result = insertTemplate.run(
-        t.title,
-        t.description,
-        t.category,
-        t.cadence_label,
-        t.cron_expr,
-        t.sop_ref,
+      const { rows: inserted } = await query(
+        `INSERT INTO task_templates (title, description, category, cadence_label, cron_expr, sop_ref, source, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'automation', 'active') RETURNING id`,
+        [t.title, t.description, t.category, t.cadence_label, t.cron_expr, t.sop_ref]
       );
-      const templateId = result.lastInsertRowid;
+      const templateId = inserted[0].id;
       for (const name of t.assignees) {
-        const member = getMemberId.get(name);
-        if (member) insertAssignee.run(templateId, member.id);
+        const { rows: memberRows } = await query("SELECT id FROM team_members WHERE name = $1", [name]);
+        if (memberRows.length) {
+          await query("INSERT INTO template_assignees (template_id, member_id) VALUES ($1, $2)", [
+            templateId,
+            memberRows[0].id,
+          ]);
+        }
       }
     }
     console.log(`Seeded ${TEMPLATES.length} task templates.`);
   }
 
-  const kpiCount = db.prepare("SELECT COUNT(*) AS n FROM kpi_snapshots").get().n;
-  if (kpiCount === 0) {
-    db.prepare(
-      "INSERT INTO kpi_snapshots (snapshot_date, metrics_json, note) VALUES (?, ?, ?)"
-    ).run(KPI_SNAPSHOT.snapshot_date, JSON.stringify(KPI_SNAPSHOT.metrics), KPI_SNAPSHOT.note);
+  const { rows: kpiCountRows } = await query("SELECT COUNT(*) AS n FROM kpi_snapshots");
+  if (Number(kpiCountRows[0].n) === 0) {
+    await query("INSERT INTO kpi_snapshots (snapshot_date, metrics, note) VALUES ($1, $2, $3)", [
+      KPI_SNAPSHOT.snapshot_date,
+      JSON.stringify(KPI_SNAPSHOT.metrics),
+      KPI_SNAPSHOT.note,
+    ]);
     console.log("Seeded KPI snapshot.");
   }
 }
-
-seed();

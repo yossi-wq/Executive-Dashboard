@@ -21,7 +21,10 @@ see what's due today, check it off, and see new items land as automations
 - **Live pop-up** — the board is backed by Server-Sent Events. Any task
   created anywhere (the UI, or a `POST` to the API) appears on every open
   browser within a second, with a toast and a highlight animation. No
-  refresh needed.
+  refresh needed. On a host that can't hold a stream open (serverless —
+  see below), the dashboard detects that within ~8s and falls back to
+  polling every ~45s automatically, so it still stays fresh without a
+  working push connection.
 - **Automations tab** — a read-only-by-default table of the 21 recurring
   templates (who they're for, cadence, SOP), with a pause/resume toggle if
   one shouldn't post tasks for a while.
@@ -31,41 +34,71 @@ see what's due today, check it off, and see new items land as automations
 ## Architecture
 
 ```
-server/   Express API + SQLite (better-sqlite3), no external DB to run
+server/   Express API, business logic — runs standalone or embedded
+api/      Vercel serverless entry point (wraps server/src/app.js)
 client/   React (Vite) single-page dashboard
 ```
 
-- `server/src/db.js` — schema: `team_members`, `task_templates` (+
-  `template_assignees`), `tasks` (+ `task_assignees`), `kpi_snapshots`.
+Backend is Postgres (via `pg`), not SQLite — a shared, multi-viewer tool
+needs a real database reachable from wherever the app runs, and a
+serverless host (see Deploying to Vercel, below) has no persistent local
+disk to put a SQLite file on anyway.
+
+- `server/src/db.js` — connects via `POSTGRES_URL` or `DATABASE_URL`;
+  `ensureSchema()` creates `team_members`, `task_templates` (+
+  `template_assignees`), `tasks` (+ `task_assignees`), `kpi_snapshots` if
+  they don't exist yet.
 - `server/src/seed.js` — one-time seed: the real team roster, the 21
-  automation-derived templates, and the KPI snapshot. Only runs on an empty
-  database, so it's safe to leave in place.
+  automation-derived templates, and the KPI snapshot. Only runs against an
+  empty database, so it's safe to leave in place.
 - `server/src/cronMatch.js` — tiny day-level cron matcher (day-of-month /
   month / weekday only — minute/hour don't matter for "does this fire
   today").
-- `server/src/materializer.js` — on boot (and hourly after), turns each
-  active template that fires today into a concrete task row, idempotently
-  (unique index on `template_id + due_date`).
-- `server/src/index.js` — REST API + `/api/stream` (SSE).
+- `server/src/materializer.js` — turns each active template that fires
+  today into a concrete task row, idempotently (unique index on
+  `template_id + due_date`).
+- `server/src/app.js` — the Express app and all routes (no `listen()` —
+  reusable by both entry points below).
+- `server/src/index.js` — local/long-running entry point: calls `app.listen`
+  and re-checks the materializer hourly (for a process that stays up across
+  midnight).
+- `api/index.js` — Vercel serverless entry point: exports the same Express
+  app directly (Vercel's Node runtime accepts an Express app as a
+  `(req, res)` handler).
 
-## Running it
+## Running it locally
+
+Needs a Postgres database reachable via `POSTGRES_URL` (or `DATABASE_URL`).
+For a quick local one: `createdb exec_dashboard` (or `docker run -p 5432:5432
+-e POSTGRES_PASSWORD=postgres postgres:16`).
 
 ```bash
 npm run install:all   # installs server + client deps
-npm run dev            # runs API on :4000 and the dashboard on :5173
+POSTGRES_URL=postgresql://postgres:postgres@localhost:5432/exec_dashboard npm run dev
 ```
 
 Open http://localhost:5173. The API is proxied under `/api` by Vite in dev.
 
-For production, `npm run build` builds the client to `client/dist/`; serve
-that as static files (e.g. behind nginx or the same Express process) and run
-`npm start` for the API. `better-sqlite3` needs a real, persistent
-filesystem — deploy to a VPS/container/Fly/Railway-style host rather than a
-serverless function platform.
+## Deploying to Vercel
+
+1. Add a Postgres database: in the Vercel project's **Storage** tab, add
+   **Vercel Postgres** (or point `DATABASE_URL` at any Postgres — Neon,
+   Supabase, etc.). This automatically sets `POSTGRES_URL` for the deployed
+   app; `server/src/db.js` picks it up with no other config.
+2. Import this repo into Vercel ("Add New… → Project", pick this repo).
+   `vercel.json` at the repo root already configures the install/build
+   commands and routes `/api/*` to the single serverless function in
+   `api/index.js` — no extra setup needed in the Vercel dashboard.
+3. Deploy. The first request seeds the database automatically (same
+   one-time seed as local dev).
+
+Note: `/api/stream` (SSE) can't hold a connection open on serverless — see
+"Live pop-up" above for how the dashboard degrades to polling automatically
+when that's the case, so the board still stays fresh either way.
 
 No auth is wired up yet — this is built as an internal tool. Put it behind
-your existing SSO/VPN, or ask for a login gate to be added, before exposing
-it outside the office network.
+your existing SSO/VPN or a Vercel deployment-protection password, or ask for
+a login gate to be added, before sharing the URL outside the team.
 
 ## Wiring real automations into the live feed
 
@@ -91,8 +124,18 @@ Content-Type: application/json
 ```
 
 That's a change to the routine's own instructions (via `update_trigger`), not
-to this app — happy to wire specific ones up on request, since it touches
-live production automations.
+to this app.
+
+**Planned next step (pending deployment):** a new, lightweight Cowork
+Routine on a 5-10 minute cadence that checks only fast-moving signals via
+the Gmail connector (no Buildium browser automation, to avoid hammering
+Buildium every few minutes) and pushes anything new straight to `/api/tasks`
+or `/api/kpi`. The other 21 templates keep their current daily/weekly/
+monthly cadence — those SOPs (delinquency, lease renewals, owner statements)
+don't change fast enough to justify 5-10 minute Buildium scraping, and doing
+that for all of them would mean ~150-280 automation runs/day. This routine
+needs the app's real deployed URL to point at — set up once the app is live
+on Vercel (or wherever it ends up).
 
 ## Team roster & templates
 

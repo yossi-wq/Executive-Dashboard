@@ -24,7 +24,20 @@ export default function App() {
   const [toasts, setToasts] = useState([]);
   const [recentIds, setRecentIds] = useState(new Set());
   const [connected, setConnected] = useState(false);
+  // "detecting" -> "sse" (a real push connection held) or "poll" (SSE never
+  // came up within the grace window, e.g. a serverless host that can't hold
+  // a long-lived stream). Decides the background refresh cadence below.
+  const [liveMode, setLiveMode] = useState("detecting");
   const toastTimer = useRef({});
+  const everConnected = useRef(false);
+  const scopeRef = useRef(scope);
+  const lastOpenAt = useRef(0);
+  const shortLivedCount = useRef(0);
+  const closeSseRef = useRef(null);
+
+  useEffect(() => {
+    scopeRef.current = scope;
+  }, [scope]);
 
   async function loadOverview() {
     setOverview(await api.getOverview());
@@ -55,18 +68,31 @@ export default function App() {
     loadTasks(scope);
   }, [scope]);
 
-  // Belt-and-suspenders refresh on top of the SSE stream: if a connection
-  // drops silently (sleep/wake, a flaky network), the board is never more
-  // than a few minutes stale.
+  // Give SSE a few seconds to prove itself on mount; if it never connects
+  // (a serverless deploy that can't hold a stream open), fall back to
+  // active polling instead of waiting on a push that will never arrive.
   useEffect(() => {
+    const timer = setTimeout(() => {
+      if (!everConnected.current) setLiveMode("poll");
+    }, 8000);
+    return () => clearTimeout(timer);
+  }, []);
+
+  // Background refresh: a 5-minute safety net on top of a working SSE
+  // stream (covers a silent drop — sleep/wake, a flaky network), or a
+  // snappier ~45s poll when SSE isn't available at all so the board still
+  // feels live without true push.
+  useEffect(() => {
+    if (liveMode === "detecting") return;
+    const ms = liveMode === "poll" ? 45 * 1000 : 5 * 60 * 1000;
     const interval = setInterval(() => {
       loadOverview();
       loadTasks();
       loadTemplates();
-    }, 5 * 60 * 1000);
+    }, ms);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope]);
+  }, [scope, liveMode]);
 
   function pushToast(message, id) {
     const toastId = `${Date.now()}-${Math.random()}`;
@@ -89,22 +115,38 @@ export default function App() {
     const unsubscribe = subscribe((event, data) => {
       if (event === "connected") {
         setConnected(true);
+        everConnected.current = true;
+        setLiveMode("sse");
+        lastOpenAt.current = Date.now();
         return;
       }
       if (event === "disconnected") {
         setConnected(false);
+        // A stream that dies within ~15s of opening, repeatedly, means
+        // something (a serverless function timeout, not a network blip) is
+        // structurally preventing a held-open connection. Stop retrying —
+        // an EventSource left to reconnect forever against a host that can
+        // never hold it open just burns a new request every few seconds —
+        // and switch to polling instead.
+        if (lastOpenAt.current && Date.now() - lastOpenAt.current < 15000) {
+          shortLivedCount.current += 1;
+          if (shortLivedCount.current >= 2) {
+            closeSseRef.current?.();
+            setLiveMode("poll");
+          }
+        }
         return;
       }
       setConnected(true);
       if (event === "task_created") {
         pushToast(`🔔 New task: ${data.title}`, data.id);
-        loadTasks();
+        loadTasks(scopeRef.current);
         loadOverview();
       } else if (event === "task_updated") {
-        loadTasks();
+        loadTasks(scopeRef.current);
         loadOverview();
       } else if (event === "task_deleted") {
-        loadTasks();
+        loadTasks(scopeRef.current);
         loadOverview();
       } else if (event === "overview_updated") {
         loadOverview();
@@ -114,9 +156,10 @@ export default function App() {
         loadTemplates();
       }
     });
+    closeSseRef.current = unsubscribe;
     return unsubscribe;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope]);
+  }, []);
 
   async function handleToggle(task) {
     const nextStatus = task.status === "done" ? "open" : "done";
@@ -161,8 +204,10 @@ export default function App() {
           <p className="app-subtitle">Operations dashboard — property management</p>
         </div>
         <div className="app-header-right">
-          <span className={`live-dot ${connected ? "on" : ""}`} />
-          <span className="live-label">{connected ? "Live" : "Connecting…"}</span>
+          <span className={`live-dot ${connected || liveMode === "poll" ? "on" : ""}`} />
+          <span className="live-label">
+            {connected ? "Live" : liveMode === "poll" ? "Live (auto-refresh)" : "Connecting…"}
+          </span>
           <button className="btn-primary" onClick={() => setModal({ defaultAssigneeId: null })}>
             + Add task
           </button>
