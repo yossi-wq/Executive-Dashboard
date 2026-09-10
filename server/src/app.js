@@ -3,6 +3,7 @@ import cors from "cors";
 import { query, ensureSchema, todayStr } from "./db.js";
 import { seed } from "./seed.js";
 import { materializeToday } from "./materializer.js";
+import * as gmail from "./gmail.js";
 
 export const app = express();
 app.use(cors());
@@ -238,46 +239,50 @@ app.get("/api/tasks", async (req, res, next) => {
   }
 });
 
+async function createTask({
+  title,
+  description = "",
+  category = "general",
+  sop_ref = "",
+  priority = "normal",
+  due_date = todayStr(),
+  assignee_ids = [],
+  assignee_names = [],
+  source = "manual",
+}) {
+  if (!title) throw Object.assign(new Error("title is required"), { status: 400 });
+
+  let resolvedAssigneeIds = [...assignee_ids];
+  if (assignee_names.length) {
+    for (const name of assignee_names) {
+      const { rows } = await query("SELECT id FROM team_members WHERE name = $1", [name]);
+      if (rows.length) resolvedAssigneeIds.push(rows[0].id);
+    }
+  }
+
+  const { rows: inserted } = await query(
+    `INSERT INTO tasks (title, description, category, sop_ref, priority, due_date, status, source)
+     VALUES ($1, $2, $3, $4, $5, $6, 'open', $7) RETURNING id`,
+    [title, description, category, sop_ref, priority, due_date, source]
+  );
+  const taskId = inserted[0].id;
+
+  for (const memberId of new Set(resolvedAssigneeIds)) {
+    await query("INSERT INTO task_assignees (task_id, member_id) VALUES ($1, $2)", [taskId, memberId]);
+  }
+
+  const { rows: taskRows } = await query("SELECT * FROM tasks WHERE id = $1", [taskId]);
+  const task = await hydrateTask(taskRows[0]);
+  broadcast("task_created", task);
+  return task;
+}
+
 async function createTaskHandler(req, res, next) {
   try {
-    const {
-      title,
-      description = "",
-      category = "general",
-      sop_ref = "",
-      priority = "normal",
-      due_date = todayStr(),
-      assignee_ids = [],
-      assignee_names = [],
-      source = "manual",
-    } = req.body || {};
-
-    if (!title) return res.status(400).json({ error: "title is required" });
-
-    let resolvedAssigneeIds = [...assignee_ids];
-    if (assignee_names.length) {
-      for (const name of assignee_names) {
-        const { rows } = await query("SELECT id FROM team_members WHERE name = $1", [name]);
-        if (rows.length) resolvedAssigneeIds.push(rows[0].id);
-      }
-    }
-
-    const { rows: inserted } = await query(
-      `INSERT INTO tasks (title, description, category, sop_ref, priority, due_date, status, source)
-       VALUES ($1, $2, $3, $4, $5, $6, 'open', $7) RETURNING id`,
-      [title, description, category, sop_ref, priority, due_date, source]
-    );
-    const taskId = inserted[0].id;
-
-    for (const memberId of new Set(resolvedAssigneeIds)) {
-      await query("INSERT INTO task_assignees (task_id, member_id) VALUES ($1, $2)", [taskId, memberId]);
-    }
-
-    const { rows: taskRows } = await query("SELECT * FROM tasks WHERE id = $1", [taskId]);
-    const task = await hydrateTask(taskRows[0]);
-    broadcast("task_created", task);
+    const task = await createTask(req.body || {});
     res.status(201).json(task);
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   }
 }
@@ -369,6 +374,101 @@ app.patch("/api/templates/:id", async (req, res, next) => {
 // the board the moment it finds something — this is what makes "new tasks
 // pop up" work for automations beyond the ones seeded at setup time.
 app.post("/api/ingest", createTaskHandler);
+
+// ---- Gmail: fast-signal polling built into the app itself -----------------
+// Cowork Routines on this account can't fire more often than hourly and
+// (separately) can't be granted connector access via this API — so this
+// gets its own direct Gmail OAuth connection instead, polled by an external
+// scheduler (see .github/workflows/gmail-poll.yml) that can run every few
+// minutes with no such limits.
+
+function redirectUriFor(req) {
+  return `${req.protocol}://${req.get("host")}/api/auth/gmail/callback`;
+}
+
+app.get("/api/auth/gmail/status", async (req, res, next) => {
+  try {
+    res.json({ connected: await gmail.isConnected() });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Visit this once, signed into the Gmail account this dashboard should
+// read, to grant read-only access. Nothing else in the app needs this —
+// only /api/cron/gmail-check.
+app.get("/api/auth/gmail/start", (req, res, next) => {
+  try {
+    res.redirect(gmail.buildAuthUrl(redirectUriFor(req)));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get("/api/auth/gmail/callback", async (req, res, next) => {
+  try {
+    const { code, error } = req.query;
+    if (error) return res.status(400).send(`Gmail authorization failed: ${error}`);
+    if (!code) return res.status(400).send("Missing authorization code");
+
+    const tokens = await gmail.exchangeCodeForTokens(code, redirectUriFor(req));
+    if (!tokens.refresh_token) {
+      return res
+        .status(400)
+        .send(
+          "Google didn't return a refresh token (it only does on first consent). " +
+            "Remove this app's access at myaccount.google.com/permissions and try /api/auth/gmail/start again."
+        );
+    }
+    await gmail.saveRefreshToken(tokens.refresh_token);
+    res.send("Gmail connected. This dashboard can now check for new mail. You can close this tab.");
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Called by an external scheduler (GitHub Actions — see
+// .github/workflows/gmail-poll.yml), not by users. Requires a shared
+// secret so nobody else can trigger it or discover whether Gmail is wired
+// up. Judges urgency with a keyword heuristic, not full LLM judgment —
+// good enough as a fast net between the fuller daily Gmail triage.
+app.post("/api/cron/gmail-check", async (req, res, next) => {
+  try {
+    const expected = process.env.CRON_SECRET;
+    if (!expected || req.get("x-cron-secret") !== expected) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+    if (!(await gmail.isConnected())) {
+      return res.status(409).json({ error: "gmail not connected — visit /api/auth/gmail/start" });
+    }
+
+    const { rows: openTasks } = await query(
+      "SELECT title, description FROM tasks WHERE status = 'open'"
+    );
+    const existingText = openTasks.map((t) => `${t.title} ${t.description}`.toLowerCase()).join("\n");
+
+    const messages = await gmail.listRecentUnread(75);
+    const created = [];
+    for (const msg of messages) {
+      const verdict = gmail.judgeUrgency(msg);
+      if (!verdict) continue;
+      const alreadyTracked = existingText.includes(msg.subject.toLowerCase().slice(0, 30));
+      if (alreadyTracked) continue;
+
+      const task = await createTask({
+        title: `Urgent email: ${msg.subject || "(no subject)"}`,
+        description: `From ${msg.from}: ${msg.snippet}`,
+        category: verdict.category,
+        assignee_names: ["Yossi Myers"],
+        source: "automation",
+      });
+      created.push(task.id);
+    }
+    res.json({ checked: messages.length, created: created.length, task_ids: created });
+  } catch (err) {
+    next(err);
+  }
+});
 
 app.use((err, req, res, next) => {
   console.error(err);

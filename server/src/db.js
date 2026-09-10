@@ -89,6 +89,15 @@ export function ensureSchema() {
         note TEXT DEFAULT '',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+
+      -- Small key/value store for things that aren't worth their own table —
+      -- currently just the Gmail OAuth refresh token captured by the
+      -- one-time /api/auth/gmail/callback consent flow.
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
     `);
   }
   return schemaReady;

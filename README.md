@@ -126,16 +126,70 @@ Content-Type: application/json
 That's a change to the routine's own instructions (via `update_trigger`), not
 to this app.
 
-**Planned next step (pending deployment):** a new, lightweight Cowork
-Routine on a 5-10 minute cadence that checks only fast-moving signals via
-the Gmail connector (no Buildium browser automation, to avoid hammering
-Buildium every few minutes) and pushes anything new straight to `/api/tasks`
-or `/api/kpi`. The other 21 templates keep their current daily/weekly/
-monthly cadence — those SOPs (delinquency, lease renewals, owner statements)
-don't change fast enough to justify 5-10 minute Buildium scraping, and doing
-that for all of them would mean ~150-280 automation runs/day. This routine
-needs the app's real deployed URL to point at — set up once the app is live
-on Vercel (or wherever it ends up).
+## Fast Gmail signal check (built into the app, not a Cowork Routine)
+
+The original plan was a Cowork Routine on a 5-10 minute cadence checking
+Gmail for anything urgent between the daily/weekly automations above. Two
+platform limits made that impossible: this account's Routines can't fire
+more often than hourly, and (separately) can't be granted Gmail connector
+access via the API used to create them at all. So this is built directly
+into the app instead, with its own Gmail OAuth connection and an external
+scheduler that isn't subject to either limit:
+
+- `server/src/gmail.js` — OAuth token exchange/refresh and a minimal Gmail
+  REST client (no `googleapis` dependency needed).
+- `GET /api/auth/gmail/start` / `GET /api/auth/gmail/callback` — one-time
+  consent flow; the refresh token lands in the `app_settings` table.
+- `POST /api/cron/gmail-check` — checks unread mail from roughly the last
+  75 minutes, flags anything matching an urgent/maintenance keyword pattern
+  that isn't already represented by an open task on the board, and creates
+  it. Requires an `x-cron-secret` header matching `CRON_SECRET` — it's meant
+  to be called only by the scheduler below, not browsed to directly.
+- `.github/workflows/gmail-poll.yml` — a GitHub Actions scheduled workflow
+  (every 7 minutes — GitHub's own minimum granularity is 5) that calls
+  `/api/cron/gmail-check`. Runs are best-effort/can slip under load, and
+  GitHub auto-disables a scheduled workflow after 60 days with no commits
+  to the repo — harmless here since the repo will keep getting pushes.
+
+This checks Gmail only, with a keyword heuristic rather than full LLM
+judgment (cheap and fast; less nuanced than the existing Daily Gmail Triage
+automation). The other 21 templates keep their existing daily/weekly/monthly
+cadence — those SOPs (delinquency, lease renewals, owner statements) don't
+move fast enough to justify frequent Buildium scraping, and Buildium may not
+tolerate a bot re-scraping it every few minutes anyway.
+
+**Setup checklist (all one-time, and all need to happen outside this
+session — this sandbox's network policy blocks Google Cloud Console and
+Vercel, so none of this is something Claude can click through):**
+
+1. **Google Cloud OAuth client** — in [Google Cloud Console](https://console.cloud.google.com):
+   create a project (or use an existing one), enable the **Gmail API**, and
+   create an **OAuth 2.0 Client ID** (type: Web application). Add
+   `https://<your-deployed-domain>/api/auth/gmail/callback` as an
+   authorized redirect URI. Note the Client ID and Client Secret.
+2. **Vercel env vars** — in the project's Settings → Environment Variables,
+   add:
+   - `GMAIL_OAUTH_CLIENT_ID`, `GMAIL_OAUTH_CLIENT_SECRET` — from step 1
+   - `CRON_SECRET` — any random string you generate (e.g. `openssl rand -hex 32`)
+
+   Redeploy after adding them (env var changes need a redeploy to take effect).
+3. **One-time Gmail consent** — visit
+   `https://<your-deployed-domain>/api/auth/gmail/start` yourself, signed
+   into the Gmail account this dashboard should read (the main EZ
+   Management inbox), and approve access. You only do this once; the
+   refresh token it captures is stored in Postgres.
+4. **GitHub Actions scheduler** — in this repo's Settings → Secrets and
+   variables → Actions:
+   - Add repo **variable** `DASHBOARD_URL` = `https://<your-deployed-domain>`
+   - Add repo **secret** `CRON_SECRET` = the same value from step 2
+
+   The workflow starts firing on the next scheduled tick after that (or
+   trigger it immediately from the Actions tab → "Poll Gmail for urgent
+   signals" → Run workflow).
+
+Until all four are done, `/api/cron/gmail-check` just returns a 409 (Gmail
+not connected) or the GitHub Action fails fast with a clear message — safe
+either way, nothing breaks by deploying before finishing this checklist.
 
 ## Team roster & templates
 
