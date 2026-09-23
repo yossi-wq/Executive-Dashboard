@@ -18,8 +18,8 @@ jobs:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: |
           if [ -z "$DASHBOARD_URL" ] || [ -z "$CRON_SECRET" ]; then
-            echo "DASHBOARD_URL repo variable and/or CRON_SECRET repo secret not set yet — see README." >&2
-            exit 1
+            echo "::notice::DASHBOARD_URL repo variable and/or CRON_SECRET repo secret not set yet — see README. Skipping without failing so this stops emailing on every run until setup is finished."
+            exit 0
           fi
           curl -sf -X POST "$DASHBOARD_URL/api/cron/gmail-check" \
             -H "x-cron-secret: $CRON_SECRET" \
